@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import inspect
+import io
+import subprocess
 import sys
 import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import spectra_to_origin as sto
 
@@ -144,6 +148,13 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(flat4, [item.path for item in spectra])
         self.assertTrue(all(spec.layout == "XYYY" for spec in specs4))
 
+    def test_unique_origin_names_do_not_collide(self) -> None:
+        names = sto.unique_origin_names(["400C", "400C", "400 C extra", "group1", "group1"])
+        lowered = [name.lower() for name in names]
+        self.assertEqual(len(lowered), len(set(lowered)))
+        self.assertTrue(all(len(name) <= 13 for name in names))
+        self.assertTrue(all(name[0].isalpha() for name in names))
+
 
 class DropLoadTests(unittest.TestCase):
     def test_simulated_drop_dedupes_temp_copies(self) -> None:
@@ -155,8 +166,9 @@ class DropLoadTests(unittest.TestCase):
         ]
         loaded = sto.load_from_drop_payload([], payload)
         names = [path.name.lower() for path in loaded]
-        self.assertEqual(len(loaded), 23)
-        self.assertEqual(len(set(names)), 23)
+        self.assertEqual(len(loaded), 24)
+        self.assertEqual(len(set(names)), 24)
+        self.assertIn("00_hr_00.00h_eta0.00000.txt", names)
         self.assertFalse(any(sto.TEMP_COPY_DIR in path.parts for path in loaded))
 
     def test_newline_and_quoted_drop_payload(self) -> None:
@@ -165,7 +177,8 @@ class DropLoadTests(unittest.TestCase):
         paths = sto.parse_drop_paths(text)
         self.assertEqual(len(paths), 2)
         loaded = sto.load_from_drop_payload([], text)
-        self.assertEqual(len(loaded), 23)
+        self.assertEqual(len(loaded), 24)
+        self.assertIn("00_HR_00.00h_eta0.00000.txt", [path.name for path in loaded])
 
     def test_window_drop_is_wired_to_load_path(self) -> None:
         source = inspect.getsource(sto.SpectraToOriginApp)
@@ -242,6 +255,136 @@ class FixtureRoundTripTests(unittest.TestCase):
             diff_book = load_workbook(diff_xlsx, data_only=True)
             diff_sheet = diff_book[diff_book.sheetnames[0]]
             self.assertEqual(diff_sheet.max_column, 4)
+
+
+class BulkCliTests(unittest.TestCase):
+    def test_cli_ingests_forty_plus_txts_into_one_workbook(self) -> None:
+        n_files = 48
+        tool = Path(sto.__file__).resolve()
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw) / "spectra"
+            folder.mkdir()
+            stems = []
+            for index in range(n_files):
+                stem = f"spec_{index:03d}"
+                stems.append(stem)
+                _write_xy(
+                    folder / f"{stem}.txt",
+                    [("0.0", str(index)), ("1.0", str(index + 1)), ("2.0", str(index + 2))],
+                )
+            opju = Path(raw) / "bulk.opju"
+            xlsx = Path(raw) / "bulk.xlsx"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool),
+                    "--cli",
+                    "-i",
+                    str(folder),
+                    "-o",
+                    str(opju),
+                    "--layout",
+                    "auto",
+                    "--also-xlsx",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            if proc.returncode == 0 and opju.exists() and opju.stat().st_size > 0:
+                inspect = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import sys\n"
+                            f"sys.path.insert(0, r'{tool.parent.as_posix()}')\n"
+                            "import originpro as op\n"
+                            "import spectra_to_origin as sto\n"
+                            "started = not sto.origin_process_running()\n"
+                            "op.set_show(False)\n"
+                            "assert op.open(sys.argv[1])\n"
+                            "sheet = list(op.pages('w'))[0][0]\n"
+                            "graphs = list(op.pages('g'))\n"
+                            "n_cols = int(sheet.cols)\n"
+                            "labels = [sheet.get_label(c, 'L') for c in range(n_cols)]\n"
+                            "n_plots = len(list(graphs[0][0].obj.DataPlots)) if graphs else 0\n"
+                            "print(n_cols, n_plots)\n"
+                            "print(','.join(str(item) for item in labels))\n"
+                            "sto.close_origin_app(op, started=started)\n"
+                        ),
+                        str(opju),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                )
+                self.assertEqual(
+                    inspect.returncode,
+                    0,
+                    f"Origin inspect failed:\nstdout={inspect.stdout}\nstderr={inspect.stderr}",
+                )
+                lines = [line for line in inspect.stdout.splitlines() if line.strip()]
+                cols_plots = lines[0].split()
+                labels = lines[1].split(",")
+                self.assertEqual(int(cols_plots[0]), 1 + n_files)
+                self.assertEqual(int(cols_plots[1]), n_files)
+                for stem in stems:
+                    self.assertIn(stem, labels)
+                self.assertFalse(sto.origin_process_running())
+                return
+
+            fallback = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool),
+                    "--cli",
+                    "--xlsx-only",
+                    "-i",
+                    str(folder),
+                    "-o",
+                    str(xlsx),
+                    "--layout",
+                    "auto",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+            self.assertEqual(fallback.returncode, 0, fallback.stderr)
+            from openpyxl import load_workbook
+
+            book = load_workbook(xlsx, data_only=True)
+            sheet = book[book.sheetnames[0]]
+            self.assertEqual(sheet.max_column, 1 + n_files)
+            headers = [sheet.cell(1, col).value for col in range(1, sheet.max_column + 1)]
+            for stem in stems:
+                self.assertIn(stem, headers)
+
+    def test_run_cli_origin_failure_is_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            _write_xy(folder / "a.txt", [("0", "1"), ("1", "2")])
+            out = folder / "out.opju"
+            args = sto.build_parser().parse_args(["--cli", "-i", str(folder), "-o", str(out)])
+
+            def _boom(*_args, **_kwargs):
+                raise sto.OriginExportError("boom")
+
+            stderr = io.StringIO()
+            with mock.patch.object(sto, "export_origin_project", side_effect=_boom):
+                with contextlib.redirect_stderr(stderr):
+                    code = sto.run_cli(args)
+            self.assertEqual(code, 4)
+            text = stderr.getvalue()
+            self.assertIn("Origin 工程生成失败", text)
+            self.assertIn("boom", text)
 
 
 if __name__ == "__main__":

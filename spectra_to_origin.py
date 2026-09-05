@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tkinter as tk
 from collections import Counter
 from dataclasses import dataclass
@@ -117,6 +119,10 @@ def _comment_from_header(header: str, stem: str) -> str:
     if not parts:
         parts.append(_long_name_from_stem(stem))
     return "; ".join(parts)
+
+
+def parse_spectra(files: list[Path]) -> list[Spectrum]:
+    return [parse_spectrum(path) for path in files]
 
 
 def parse_spectrum(path: Path) -> Spectrum:
@@ -505,6 +511,22 @@ def origin_sheet_name(raw: str) -> str:
     return token[:13]
 
 
+def unique_origin_names(raw_names: list[str], limit: int = 13) -> list[str]:
+    used: set[str] = set()
+    names: list[str] = []
+    for raw in raw_names:
+        base = origin_sheet_name(raw)[:limit]
+        candidate = base
+        serial = 2
+        while candidate.lower() in used:
+            suffix = str(serial)
+            candidate = (base[: max(1, limit - len(suffix))] + suffix)[:limit]
+            serial += 1
+        used.add(candidate.lower())
+        names.append(candidate)
+    return names
+
+
 def readme_rows(spectra: list[Spectrum], layout: str, group_names: list[str]) -> list[list[str]]:
     shared = "yes" if shared_x_grid(spectra) else "no"
     rows = [
@@ -601,7 +623,12 @@ def export_spectra(
 ) -> tuple[Path, Path | None]:
     if not files:
         raise ValueError("没有谱线文件")
-    spectra = [parse_spectrum(path) for path in files]
+    if groups:
+        spectra = [item for _name, items in groups for item in items]
+    else:
+        spectra = parse_spectra(files)
+    if not spectra:
+        raise ValueError("没有谱线文件")
     resolved_groups = resolve_groups(spectra, groups=groups, split_temp=split_temp, n_groups=n_groups)
     resolved_layout = resolve_layout(spectra, layout)
     tables = build_export_tables(spectra, resolved_layout, resolved_groups)
@@ -633,6 +660,28 @@ def origin_process_running() -> bool:
     return "Origin64.exe" in output
 
 
+def close_origin_app(op, *, started: bool, timeout: float = 8.0) -> None:
+    """Quit Origin COM and, if this call started the process, wait until it dies."""
+    try:
+        op.exit()
+    except Exception:
+        pass
+    if not started or sys.platform != "win32":
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not origin_process_running():
+            return
+        time.sleep(0.2)
+    if origin_process_running():
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "Origin64.exe", "/T"],
+            capture_output=True,
+            text=True,
+            errors="ignore",
+        )
+
+
 def _load_originpro():
     try:
         import originpro as op
@@ -644,40 +693,44 @@ def _load_originpro():
     return op
 
 
+def _pad_column(values: list[float], n_rows: int) -> list[float]:
+    if len(values) >= n_rows:
+        return values[:n_rows]
+    return values + [float("nan")] * (n_rows - len(values))
+
+
 def _fill_origin_sheet(sheet, spectra: list[Spectrum], layout: str) -> None:
     layout = resolve_layout(spectra, layout)
     if layout == "XYYY":
         if not shared_x_grid(spectra):
             names = ", ".join(item.path.name for item in spectra[:4])
             raise ValueError(f"X 网格不一致，不能用 XYYY。请改选 XYXY。涉及文件：{names}")
-        sheet.cols = 1 + len(spectra)
-        sheet.from_list(0, spectra[0].x_values, lname=X_LONG_NAME, units=X_UNITS, axis="X")
-        for index, item in enumerate(spectra, start=1):
-            sheet.from_list(
-                index,
-                item.y_values,
-                lname=item.long_name,
-                units=Y_UNITS,
-                comments=item.comment,
-                axis="Y",
-            )
-        return
-    if layout == "XYXY":
-        sheet.cols = 2 * len(spectra)
-        for index, item in enumerate(spectra):
-            x_col = 2 * index
-            y_col = x_col + 1
-            sheet.from_list(x_col, item.x_values, lname=X_LONG_NAME, units=X_UNITS, axis="X")
-            sheet.from_list(
-                y_col,
-                item.y_values,
-                lname=item.long_name,
-                units=Y_UNITS,
-                comments=item.comment,
-                axis="Y",
-            )
-        return
-    raise ValueError(f"不支持的布局：{layout}")
+        columns = [spectra[0].x_values] + [item.y_values for item in spectra]
+        longs = [X_LONG_NAME, *(item.long_name for item in spectra)]
+        units = [X_UNITS, *(Y_UNITS for _ in spectra)]
+        comments = ["", *(item.comment for item in spectra)]
+        axes = "x" + "y" * len(spectra)
+    elif layout == "XYXY":
+        n_rows = max(item.n_points for item in spectra)
+        columns = []
+        longs: list[str] = []
+        units: list[str] = []
+        comments: list[str] = []
+        for item in spectra:
+            columns.append(_pad_column(item.x_values, n_rows))
+            columns.append(_pad_column(item.y_values, n_rows))
+            longs.extend([X_LONG_NAME, item.long_name])
+            units.extend([X_UNITS, Y_UNITS])
+            comments.extend(["", item.comment])
+        axes = "xy" * len(spectra)
+    else:
+        raise ValueError(f"不支持的布局：{layout}")
+    sheet.cols = len(columns)
+    sheet.from_list2(columns, 0, 0)
+    sheet.set_labels(longs, "L")
+    sheet.set_labels(units, "U")
+    sheet.set_labels(comments, "C")
+    sheet.cols_axis(axes)
 
 
 def _plot_origin_sheet(op, sheet, spectra: list[Spectrum], layout: str, graph_name: str):
@@ -715,25 +768,22 @@ def _save_origin_project(op, path: Path) -> Path:
     if path.suffix.lower() != ".opju":
         path = path.with_suffix(".opju")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.unlink()
-
-    saved = op.save(str(path))
-    if path.exists() and path.stat().st_size > 0:
+    tmp_dir = Path(tempfile.mkdtemp(prefix="spectra_opju_"))
+    tmp_path = tmp_dir / "export.opju"
+    saved = op.save(str(tmp_path))
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        saved = op.save(str(path))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if not path.exists() or path.stat().st_size == 0:
+            raise OriginExportError(
+                f"Origin 没有写出 .opju 文件（save 返回 {saved!r}）。"
+                "请确认 Origin Pro 已启动且未被其他对话框挡住。"
+            )
         return path
-
-    temp_path = Path(tempfile.gettempdir()) / path.name
-    if temp_path.exists():
-        temp_path.unlink()
-    saved = op.save(str(temp_path))
-    if not temp_path.exists() or temp_path.stat().st_size == 0:
-        raise OriginExportError(
-            f"Origin 没有写出 .opju 文件（save 返回 {saved!r}）。"
-            "请确认 Origin Pro 已启动且未被其他对话框挡住。"
-        )
-    shutil.copy2(temp_path, path)
+    os.replace(tmp_path, path)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     if not path.exists() or path.stat().st_size == 0:
-        raise OriginExportError(f"Origin 写出了临时文件 {temp_path}，但无法复制到 {path}")
+        raise OriginExportError(f"Origin 保存后文件仍不存在或为空：{path}")
     return path
 
 
@@ -754,6 +804,7 @@ def write_origin_project(
     resolved_layout = specs[0].layout
     op = _load_originpro()
     closed = False
+    started = not origin_process_running()
     try:
         op.set_show(bool(show_origin) or bool(keep_open))
         op.new(False)
@@ -764,8 +815,8 @@ def write_origin_project(
         book.lname = f"spectra_{resolved_layout}"
         for extra in books[1:]:
             extra.destroy()
-        for index, spec in enumerate(specs):
-            short = origin_sheet_name(spec.name)
+        shorts = unique_origin_names([spec.name for spec in specs])
+        for index, (spec, short) in enumerate(zip(specs, shorts)):
             sheet = book[0] if index == 0 else book.add_sheet(short)
             sheet.name = short
             sheet.lname = spec.name
@@ -776,7 +827,7 @@ def write_origin_project(
         if keep_open:
             op.set_show(True)
         else:
-            op.exit()
+            close_origin_app(op, started=started)
             closed = True
         if not saved.exists() or saved.stat().st_size == 0:
             raise OriginExportError(f"Origin 保存后文件仍不存在或为空：{saved}")
@@ -787,10 +838,7 @@ def write_origin_project(
         raise OriginExportError(f"Origin 工程生成失败：{exc}") from exc
     finally:
         if not keep_open and not closed:
-            try:
-                op.exit()
-            except Exception:
-                pass
+            close_origin_app(op, started=started)
 
 
 def export_origin_project(
@@ -804,9 +852,14 @@ def export_origin_project(
     keep_open: bool = False,
     also_xlsx: bool = False,
 ) -> tuple[Path, Path | None, Path | None]:
-    if not files:
+    if not files and not groups:
         raise ValueError("没有谱线文件")
-    spectra = [parse_spectrum(path) for path in files]
+    if groups:
+        spectra = [item for _name, items in groups for item in items]
+    else:
+        spectra = parse_spectra(files)
+    if not spectra:
+        raise ValueError("没有谱线文件")
     resolved_groups = resolve_groups(spectra, groups=groups, split_temp=split_temp, n_groups=n_groups)
     opju_path = write_origin_project(
         spectra,
@@ -924,13 +977,9 @@ def _enable_windows_file_drop(widget: tk.Misc, on_paths) -> bool:
     return True
 
 
-def _status_text(files: list[Path], layout: str, assignments: list[str]) -> str:
-    if not files:
+def _status_text(spectra: list[Spectrum], layout: str, assignments: list[str]) -> str:
+    if not spectra:
         return "把谱线 txt 或文件夹拖进窗口，或点添加。X 相同会识别为 XYYY，不同则为 XYXY。"
-    try:
-        spectra = [parse_spectrum(path) for path in files]
-    except ValueError as exc:
-        return f"读取失败：{exc}"
     inferred = infer_layout(spectra)
     resolved = resolve_layout(spectra, layout)
     n_points = {item.n_points for item in spectra}
@@ -953,6 +1002,8 @@ class SpectraToOriginApp:
         self.files: list[Path] = []
         self.assignments: list[str] = []
         self._user_grouped = False
+        self._cached_key: tuple[Path, ...] | None = None
+        self._cached_spectra: list[Spectrum] = []
         self.root = tk.Tk()
         self.root.title("谱线 → Origin 工程")
         self.root.minsize(820, 560)
@@ -1055,8 +1106,20 @@ class SpectraToOriginApp:
             self.group_choice.set(names[0])
         self._refresh_status()
 
+    def _parsed_spectra(self) -> list[Spectrum]:
+        key = tuple(self.files)
+        if self._cached_key != key:
+            self._cached_spectra = parse_spectra(self.files) if self.files else []
+            self._cached_key = key
+        return self._cached_spectra
+
     def _refresh_status(self) -> None:
-        self.status.config(text=_status_text(self.files, self.layout_var.get(), self.assignments))
+        try:
+            spectra = self._parsed_spectra()
+        except ValueError as exc:
+            self.status.config(text=f"读取失败：{exc}")
+            return
+        self.status.config(text=_status_text(spectra, self.layout_var.get(), self.assignments))
 
     def _set_assignments(self, assignments: list[str], *, user: bool) -> None:
         self.assignments = assignments
@@ -1175,7 +1238,7 @@ class SpectraToOriginApp:
         self._set_assignments(self.assignments, user=True)
 
     def _export_groups(self) -> list[tuple[str, list[Spectrum]]]:
-        spectra = [parse_spectrum(path) for path in self.files]
+        spectra = self._parsed_spectra()
         grouped_paths = groups_from_assignments(self.files, self.assignments)
         by_path = {item.path.resolve(): item for item in spectra}
         return [
@@ -1189,9 +1252,8 @@ class SpectraToOriginApp:
             return
         layout = self.layout_var.get()
         default_dir = self.files[0].parent
-        default_name = f"origin_{resolve_layout([parse_spectrum(path) for path in self.files[:1]], layout)}.opju"
         try:
-            resolved = resolve_layout([parse_spectrum(path) for path in self.files], layout)
+            resolved = resolve_layout(self._parsed_spectra(), layout)
             default_name = f"origin_{resolved}.opju"
         except ValueError:
             default_name = "origin_spectra.opju"
@@ -1276,6 +1338,8 @@ def run_cli(args: argparse.Namespace) -> int:
     for raw in args.input:
         files = load_from_drop_payload(files, [raw])
     output = Path(args.output)
+    if origin_process_running() and not args.xlsx_only:
+        print("警告：检测到 Origin 正在运行。本工具会新建空工程，未保存的 Origin 工作可能丢失。", file=sys.stderr)
     try:
         if args.xlsx_only:
             xlsx_path, csv_path = export_spectra(
