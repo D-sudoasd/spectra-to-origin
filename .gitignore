@@ -7,3 +7,5 @@ __pycache__/
 .venv/
 venv/
 *.log
+_test_out/
+origin_unavailable.txt

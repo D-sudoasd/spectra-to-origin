@@ -763,28 +763,54 @@ def _plot_origin_sheet(op, sheet, spectra: list[Spectrum], layout: str, graph_na
     return graph
 
 
+def commit_exported_file(src: Path, dest: Path) -> Path:
+    """Move a finished export onto dest, including Windows C:→D: (WinError 17)."""
+    src = src.expanduser().resolve()
+    dest = dest.expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not src.exists() or src.stat().st_size == 0:
+        raise OriginExportError(f"Origin 临时文件不存在或为空：{src}")
+    try:
+        os.replace(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+        try:
+            src.unlink()
+        except OSError:
+            pass
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise OriginExportError(f"无法把 Origin 工程写到 {dest}")
+    return dest
+
+
 def _save_origin_project(op, path: Path) -> Path:
     path = path.expanduser().resolve()
     if path.suffix.lower() != ".opju":
         path = path.with_suffix(".opju")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="spectra_opju_"))
-    tmp_path = tmp_dir / "export.opju"
-    saved = op.save(str(tmp_path))
-    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-        saved = op.save(str(path))
+    tmp_dirs: list[Path] = []
+    try:
+        tmp_dirs.append(Path(tempfile.mkdtemp(prefix="spectra_opju_", dir=str(path.parent))))
+    except OSError:
+        pass
+    tmp_dirs.append(Path(tempfile.mkdtemp(prefix="spectra_opju_")))
+    last_saved = None
+    for tmp_dir in tmp_dirs:
+        tmp_path = tmp_dir / "export.opju"
+        last_saved = op.save(str(tmp_path))
+        if tmp_path.exists() and tmp_path.stat().st_size > 0:
+            try:
+                return commit_exported_file(tmp_path, path)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        if not path.exists() or path.stat().st_size == 0:
-            raise OriginExportError(
-                f"Origin 没有写出 .opju 文件（save 返回 {saved!r}）。"
-                "请确认 Origin Pro 已启动且未被其他对话框挡住。"
-            )
+    last_saved = op.save(str(path))
+    if path.exists() and path.stat().st_size > 0:
         return path
-    os.replace(tmp_path, path)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    if not path.exists() or path.stat().st_size == 0:
-        raise OriginExportError(f"Origin 保存后文件仍不存在或为空：{path}")
-    return path
+    raise OriginExportError(
+        f"Origin 没有写出 .opju 文件（save 返回 {last_saved!r}）。"
+        "请确认 Origin Pro 已启动且未被其他对话框挡住。"
+    )
 
 
 def write_origin_project(

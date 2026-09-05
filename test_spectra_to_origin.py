@@ -6,6 +6,8 @@ import contextlib
 import ctypes
 import inspect
 import io
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -155,6 +157,26 @@ class GroupTests(unittest.TestCase):
         self.assertTrue(all(len(name) <= 13 for name in names))
         self.assertTrue(all(name[0].isalpha() for name in names))
 
+    def test_commit_exported_file_cross_drive(self) -> None:
+        c_root = Path(tempfile.gettempdir()).resolve()
+        d_root = Path(sto.__file__).resolve().parent / "_test_out"
+        d_root.mkdir(parents=True, exist_ok=True)
+        src_dir = Path(tempfile.mkdtemp(prefix="opju_src_", dir=str(c_root)))
+        src = src_dir / "export.opju"
+        payload = b"OPJU-CROSS-DRIVE-TEST"
+        src.write_bytes(payload)
+        dest = d_root / "committed.opju"
+        if dest.exists():
+            dest.unlink()
+        self.assertNotEqual(src.drive.lower(), dest.drive.lower())
+        result = sto.commit_exported_file(src, dest)
+        self.assertEqual(result, dest.resolve())
+        self.assertTrue(dest.exists())
+        self.assertEqual(dest.read_bytes(), payload)
+        self.assertFalse(src.exists())
+        dest.unlink()
+        shutil.rmtree(src_dir, ignore_errors=True)
+
 
 class DropLoadTests(unittest.TestCase):
     def test_simulated_drop_dedupes_temp_copies(self) -> None:
@@ -257,10 +279,28 @@ class FixtureRoundTripTests(unittest.TestCase):
             self.assertEqual(diff_sheet.max_column, 4)
 
 
+def _origin_unavailable_path() -> Path:
+    env = os.environ.get("ORIGIN_UNAVAILABLE_PATH", "").strip()
+    if env:
+        return Path(env)
+    return Path(sto.__file__).resolve().parent / "origin_unavailable.txt"
+
+
+def _record_origin_unavailable(reason: str) -> None:
+    path = _origin_unavailable_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(reason, encoding="utf-8")
+
+
 class BulkCliTests(unittest.TestCase):
     def test_cli_ingests_forty_plus_txts_into_one_workbook(self) -> None:
         n_files = 48
         tool = Path(sto.__file__).resolve()
+        dest_dir = tool.parent / "_test_out"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        opju = dest_dir / "bulk.opju"
+        if opju.exists():
+            opju.unlink()
         with tempfile.TemporaryDirectory() as raw:
             folder = Path(raw) / "spectra"
             folder.mkdir()
@@ -272,8 +312,7 @@ class BulkCliTests(unittest.TestCase):
                     folder / f"{stem}.txt",
                     [("0.0", str(index)), ("1.0", str(index + 1)), ("2.0", str(index + 2))],
                 )
-            opju = Path(raw) / "bulk.opju"
-            xlsx = Path(raw) / "bulk.xlsx"
+            self.assertNotEqual(Path(tempfile.gettempdir()).resolve().drive.lower(), opju.drive.lower())
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -285,7 +324,6 @@ class BulkCliTests(unittest.TestCase):
                     str(opju),
                     "--layout",
                     "auto",
-                    "--also-xlsx",
                 ],
                 capture_output=True,
                 text=True,
@@ -293,63 +331,35 @@ class BulkCliTests(unittest.TestCase):
                 errors="replace",
                 timeout=180,
             )
-            if proc.returncode == 0 and opju.exists() and opju.stat().st_size > 0:
-                inspect = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        (
-                            "import sys\n"
-                            f"sys.path.insert(0, r'{tool.parent.as_posix()}')\n"
-                            "import originpro as op\n"
-                            "import spectra_to_origin as sto\n"
-                            "started = not sto.origin_process_running()\n"
-                            "op.set_show(False)\n"
-                            "assert op.open(sys.argv[1])\n"
-                            "sheet = list(op.pages('w'))[0][0]\n"
-                            "graphs = list(op.pages('g'))\n"
-                            "n_cols = int(sheet.cols)\n"
-                            "labels = [sheet.get_label(c, 'L') for c in range(n_cols)]\n"
-                            "n_plots = len(list(graphs[0][0].obj.DataPlots)) if graphs else 0\n"
-                            "print(n_cols, n_plots)\n"
-                            "print(','.join(str(item) for item in labels))\n"
-                            "sto.close_origin_app(op, started=started)\n"
-                        ),
-                        str(opju),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120,
+            if proc.returncode != 0 or not opju.exists() or opju.stat().st_size == 0:
+                _record_origin_unavailable(
+                    f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}\n"
+                    f"opju_exists={opju.exists()}\n"
                 )
-                self.assertEqual(
-                    inspect.returncode,
-                    0,
-                    f"Origin inspect failed:\nstdout={inspect.stdout}\nstderr={inspect.stderr}",
-                )
-                lines = [line for line in inspect.stdout.splitlines() if line.strip()]
-                cols_plots = lines[0].split()
-                labels = lines[1].split(",")
-                self.assertEqual(int(cols_plots[0]), 1 + n_files)
-                self.assertEqual(int(cols_plots[1]), n_files)
-                for stem in stems:
-                    self.assertIn(stem, labels)
-                self.assertFalse(sto.origin_process_running())
-                return
+                self.fail(f"Origin CLI did not write .opju; see origin_unavailable.txt\n{proc.stderr}")
 
-            fallback = subprocess.run(
+            inspect = subprocess.run(
                 [
                     sys.executable,
-                    str(tool),
-                    "--cli",
-                    "--xlsx-only",
-                    "-i",
-                    str(folder),
-                    "-o",
-                    str(xlsx),
-                    "--layout",
-                    "auto",
+                    "-c",
+                    (
+                        "import sys\n"
+                        f"sys.path.insert(0, r'{tool.parent.as_posix()}')\n"
+                        "import originpro as op\n"
+                        "import spectra_to_origin as sto\n"
+                        "started = not sto.origin_process_running()\n"
+                        "op.set_show(False)\n"
+                        "assert op.open(sys.argv[1])\n"
+                        "sheet = list(op.pages('w'))[0][0]\n"
+                        "graphs = list(op.pages('g'))\n"
+                        "n_cols = int(sheet.cols)\n"
+                        "labels = [sheet.get_label(c, 'L') for c in range(n_cols)]\n"
+                        "n_plots = len(list(graphs[0][0].obj.DataPlots)) if graphs else 0\n"
+                        "print(n_cols, n_plots)\n"
+                        "print(','.join(str(item) for item in labels))\n"
+                        "sto.close_origin_app(op, started=started)\n"
+                    ),
+                    str(opju),
                 ],
                 capture_output=True,
                 text=True,
@@ -357,15 +367,22 @@ class BulkCliTests(unittest.TestCase):
                 errors="replace",
                 timeout=120,
             )
-            self.assertEqual(fallback.returncode, 0, fallback.stderr)
-            from openpyxl import load_workbook
-
-            book = load_workbook(xlsx, data_only=True)
-            sheet = book[book.sheetnames[0]]
-            self.assertEqual(sheet.max_column, 1 + n_files)
-            headers = [sheet.cell(1, col).value for col in range(1, sheet.max_column + 1)]
+            if inspect.returncode != 0:
+                _record_origin_unavailable(
+                    f"inspect returncode={inspect.returncode}\nstdout={inspect.stdout}\nstderr={inspect.stderr}\n"
+                )
+                self.fail(f"Origin inspect failed; see origin_unavailable.txt\n{inspect.stderr}")
+            lines = [line for line in inspect.stdout.splitlines() if line.strip()]
+            cols_plots = lines[0].split()
+            labels = lines[1].split(",")
+            self.assertEqual(int(cols_plots[0]), 1 + n_files)
+            self.assertEqual(int(cols_plots[1]), n_files)
             for stem in stems:
-                self.assertIn(stem, headers)
+                self.assertIn(stem, labels)
+            print(
+                f"BULK_OPJU dest={opju} n_cols={cols_plots[0]} n_plots={cols_plots[1]}",
+                flush=True,
+            )
 
     def test_run_cli_origin_failure_is_visible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
