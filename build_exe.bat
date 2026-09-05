@@ -1,0 +1,14 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+py -3 -m pip install -q pyinstaller openpyxl
+if errorlevel 1 (
+  echo Failed to install PyInstaller.
+  exit /b 1
+)
+py -3 -m PyInstaller --noconfirm --clean SpectraToOrigin.spec
+if errorlevel 1 (
+  echo PyInstaller failed.
+  exit /b 1
+)
+echo Built dist\SpectraToOrigin.exe

@@ -53,6 +53,14 @@ xlsx/csv export works without Origin (`--xlsx-only`). `.opju` does not.
 
 ## Run
 
+### Windows .exe (double-click)
+
+Download **SpectraToOrigin.exe** from [Releases](https://github.com/D-sudoasd/spectra-to-origin/releases). Double-click it. No Python install is required.
+
+Writing a `.opju` still needs **Origin Pro** on that PC. Without Origin you can still load spectra and export xlsx/csv.
+
+### From source
+
 ```powershell
 cd path\to\spectra-to-origin
 py -3 -m pip install -r requirements.txt
@@ -130,7 +138,9 @@ MIT. See [LICENSE](LICENSE).
 
 ### 怎么用
 
-双击 `run.bat`，把文件夹拖进窗口，点 **生成 Origin 工程 (.opju)**。
+最省事：在 [Releases](https://github.com/D-sudoasd/spectra-to-origin/releases) 下载 `SpectraToOrigin.exe`，双击打开。不需要先装 Python。写出 `.opju` 仍需要本机有 Origin Pro。
+
+也可以双击 `run.bat`，把文件夹拖进窗口，点 **生成 Origin 工程 (.opju)**。
 
 命令行：
 

@@ -9,3 +9,5 @@ venv/
 *.log
 _test_out/
 origin_unavailable.txt
+build/
+dist/

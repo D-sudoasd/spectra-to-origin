@@ -1401,7 +1401,26 @@ def run_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _attach_console_if_cli(argv: list[str] | None) -> None:
+    args = list(argv if argv is not None else sys.argv[1:])
+    wants_console = any(flag in args for flag in ("--cli", "-h", "--help"))
+    if not wants_console or not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return
+    try:
+        from ctypes import windll
+
+        attached = windll.kernel32.AttachConsole(-1)
+        if attached == 0:
+            windll.kernel32.AllocConsole()
+        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+    except Exception:
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
+    _attach_console_if_cli(argv)
     args = build_parser().parse_args(argv)
     if args.cli:
         return run_cli(args)
@@ -1414,4 +1433,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     raise SystemExit(main())
